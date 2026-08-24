@@ -17,13 +17,14 @@
  * under the License.
  */
 
-use arrow::pyarrow::ToPyArrow;
+use arrow::pyarrow::{PyArrowType, ToPyArrow};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use std::collections::HashMap;
 use std::convert::From;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
@@ -33,7 +34,7 @@ use datafusion::error::DataFusionError;
 
 use hudi::config::plan::HudiPlanConfig;
 use hudi::config::read::HudiReadConfig;
-use hudi::config::table::HudiTableConfig;
+use hudi::config::table::{HudiTableConfig, TableTypeValue};
 use hudi::error::CoreError;
 use hudi::error::Result as HudiResult;
 use hudi::file_group::FileGroup;
@@ -41,7 +42,10 @@ use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
-use hudi::table::{QueryType, ReadOptions, Table};
+use hudi::table::{
+    AppendResult as RustAppendResult, QueryType, ReadOptions, Table, UpsertOptions,
+    WriteResult as RustWriteResult,
+};
 use hudi::timeline::Timeline;
 use hudi::timeline::instant::Instant;
 use pyo3::exceptions::PyException;
@@ -669,6 +673,81 @@ impl From<&Instant> for HudiInstant {
     }
 }
 
+/// Result returned by an append write.
+#[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug)]
+#[pyclass(frozen, get_all)]
+pub struct HudiAppendResult {
+    pub instant: String,
+    pub commit_relative_path: String,
+    pub base_file_path: String,
+    pub num_rows: usize,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiAppendResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "HudiAppendResult(instant={:?}, num_rows={})",
+            self.instant, self.num_rows
+        )
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+impl From<RustAppendResult> for HudiAppendResult {
+    fn from(result: RustAppendResult) -> Self {
+        Self {
+            instant: result.instant,
+            commit_relative_path: result.commit_relative_path,
+            base_file_path: result.base_file_path,
+            num_rows: result.num_rows,
+        }
+    }
+}
+
+/// Result returned by an upsert, delete, update, or overwrite write.
+#[cfg(not(tarpaulin_include))]
+#[derive(Clone, Debug)]
+#[pyclass(frozen, get_all)]
+pub struct HudiWriteResult {
+    pub instant: String,
+    pub num_writes: usize,
+    pub num_updates: usize,
+    pub num_inserts: usize,
+    pub num_deletes: usize,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiWriteResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "HudiWriteResult(instant={:?}, num_writes={}, num_updates={}, num_inserts={}, num_deletes={})",
+            self.instant, self.num_writes, self.num_updates, self.num_inserts, self.num_deletes
+        )
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+impl From<RustWriteResult> for HudiWriteResult {
+    fn from(result: RustWriteResult) -> Self {
+        Self {
+            instant: result.instant,
+            num_writes: result.num_writes,
+            num_updates: result.num_updates,
+            num_inserts: result.num_inserts,
+            num_deletes: result.num_deletes,
+        }
+    }
+}
+
+#[cfg(not(tarpaulin_include))]
+fn unwrap_record_batches(batches: Vec<PyArrowType<RecordBatch>>) -> Vec<RecordBatch> {
+    batches.into_iter().map(|batch| batch.0).collect()
+}
+
 #[cfg(not(tarpaulin_include))]
 #[pyclass]
 pub struct HudiTable {
@@ -693,6 +772,74 @@ impl HudiTable {
             .map_err(PythonError::from)
         })?;
         Ok(HudiTable { inner })
+    }
+
+    /// Create a new Hudi table and return an open handle to it.
+    #[staticmethod]
+    #[pyo3(signature = (
+        base_uri,
+        table_name,
+        table_type = "COPY_ON_WRITE",
+        record_key_fields = None,
+        partition_fields = None,
+        ordering_fields = None,
+        table_version = 9,
+        metadata_enabled = true,
+        record_index_enabled = None,
+        column_stats_enabled = None,
+        partition_stats_enabled = None,
+        hive_style_partitioning = true,
+        hudi_options = None,
+        storage_options = None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        py: Python,
+        base_uri: String,
+        table_name: String,
+        table_type: &str,
+        record_key_fields: Option<Vec<String>>,
+        partition_fields: Option<Vec<String>>,
+        ordering_fields: Option<Vec<String>>,
+        table_version: isize,
+        metadata_enabled: bool,
+        record_index_enabled: Option<bool>,
+        column_stats_enabled: Option<bool>,
+        partition_stats_enabled: Option<bool>,
+        hive_style_partitioning: bool,
+        hudi_options: Option<HashMap<String, String>>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let table_type = TableTypeValue::from_str(table_type).map_err(convert_to_py_err)?;
+        let mut builder = Table::create(base_uri)
+            .with_table_name(table_name)
+            .with_table_type(table_type)
+            .with_table_version(table_version)
+            .with_record_key_fields(record_key_fields.unwrap_or_default())
+            .with_partition_fields(partition_fields.unwrap_or_default())
+            .with_ordering_fields(ordering_fields.unwrap_or_default())
+            .with_metadata(metadata_enabled)
+            .with_hive_style_partitioning(hive_style_partitioning);
+
+        if let Some(enabled) = record_index_enabled {
+            builder = builder.with_record_index(enabled);
+        }
+        if let Some(enabled) = column_stats_enabled {
+            builder = builder.with_column_stats(enabled);
+        }
+        if let Some(enabled) = partition_stats_enabled {
+            builder = builder.with_partition_stats(enabled);
+        }
+
+        for (key, value) in hudi_options.unwrap_or_default() {
+            builder = builder.with_option(key, value);
+        }
+        for (key, value) in storage_options.unwrap_or_default() {
+            builder = builder.with_storage_option(key, value);
+        }
+
+        let inner = py.detach(|| rt().block_on(builder.create()).map_err(PythonError::from))?;
+        Ok(Self { inner })
     }
 
     fn hudi_options(&self) -> HashMap<String, String> {
@@ -848,6 +995,102 @@ impl HudiTable {
                 .map_err(PythonError::from)
         })?;
         Ok(HudiRecordBatchStream::from_stream(stream))
+    }
+
+    /// Append PyArrow record batches as a new insert commit.
+    fn append(
+        &mut self,
+        batches: Vec<PyArrowType<RecordBatch>>,
+        py: Python,
+    ) -> PyResult<HudiAppendResult> {
+        let batches = unwrap_record_batches(batches);
+        Ok(py.detach(|| {
+            rt().block_on(self.inner.append(batches))
+                .map(HudiAppendResult::from)
+                .map_err(PythonError::from)
+        })?)
+    }
+
+    /// Append PyArrow record batches to a strict append-only table.
+    fn append_only(
+        &mut self,
+        batches: Vec<PyArrowType<RecordBatch>>,
+        py: Python,
+    ) -> PyResult<HudiAppendResult> {
+        let batches = unwrap_record_batches(batches);
+        Ok(py.detach(|| {
+            rt().block_on(self.inner.append_only(batches))
+                .map(HudiAppendResult::from)
+                .map_err(PythonError::from)
+        })?)
+    }
+
+    /// Upsert complete or partial records by the table's configured record key.
+    #[pyo3(signature = (batches, update_columns=None))]
+    fn upsert(
+        &mut self,
+        batches: Vec<PyArrowType<RecordBatch>>,
+        update_columns: Option<Vec<String>>,
+        py: Python,
+    ) -> PyResult<HudiWriteResult> {
+        let batches = unwrap_record_batches(batches);
+        let options = UpsertOptions { update_columns };
+        Ok(py.detach(|| {
+            rt().block_on(self.inner.upsert_with(batches, options))
+                .map(HudiWriteResult::from)
+                .map_err(PythonError::from)
+        })?)
+    }
+
+    /// Replace all rows in the table.
+    fn overwrite(
+        &mut self,
+        batches: Vec<PyArrowType<RecordBatch>>,
+        py: Python,
+    ) -> PyResult<HudiWriteResult> {
+        let batches = unwrap_record_batches(batches);
+        Ok(py.detach(|| {
+            rt().block_on(self.inner.overwrite(batches))
+                .map(HudiWriteResult::from)
+                .map_err(PythonError::from)
+        })?)
+    }
+
+    /// Replace the partitions present in the input batches.
+    fn dynamic_partition_overwrite(
+        &mut self,
+        batches: Vec<PyArrowType<RecordBatch>>,
+        py: Python,
+    ) -> PyResult<HudiWriteResult> {
+        let batches = unwrap_record_batches(batches);
+        Ok(py.detach(|| {
+            rt().block_on(self.inner.dynamic_partition_overwrite(batches))
+                .map(HudiWriteResult::from)
+                .map_err(PythonError::from)
+        })?)
+    }
+
+    /// Delete rows matching a Hudi write-filter expression.
+    fn delete(&mut self, filter: &str, py: Python) -> PyResult<HudiWriteResult> {
+        Ok(py.detach(|| {
+            rt().block_on(self.inner.delete(filter))
+                .map(HudiWriteResult::from)
+                .map_err(PythonError::from)
+        })?)
+    }
+
+    /// Update matching rows from a single-row PyArrow record batch.
+    fn update(
+        &mut self,
+        filter: &str,
+        updates: PyArrowType<RecordBatch>,
+        py: Python,
+    ) -> PyResult<HudiWriteResult> {
+        Ok(py.detach(|| {
+            rt().block_on(self.inner.update(filter, updates.0))
+                .map(HudiWriteResult::from)
+                .map_err(PythonError::from)
+        })?)
     }
 }
 

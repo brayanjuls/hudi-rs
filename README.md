@@ -315,7 +315,7 @@ std::vector<std::string> log_file_paths{};
 ArrowArrayStream* stream_ptr = reader->read_file_slice_from_paths("relative/path.parquet", log_file_paths);
 ```
 
-## Writing Tables (Rust)
+## Writing Tables
 
 hudi-rs includes a native, single-node write path that is storage-compatible
 with the Apache Hudi Spark writer: tables written here are readable — and
@@ -326,9 +326,59 @@ metadata table (file listings, column/partition stats, record-level index) on
 every commit. See [docs/writer-design.md](docs/writer-design.md) for the full
 design.
 
-> [!NOTE]
-> Write APIs are currently Rust-only; Python and C++ bindings expose the read
-> APIs shown above.
+Python write bindings accept PyArrow record batches directly. Install the
+optional Polars adapter with `pip install 'hudi[polars]'` to read and write
+`polars.DataFrame` or `polars.LazyFrame` values.
+
+### Python + Polars
+
+```python
+import polars as pl
+
+from hudi.polars import HudiPolarsTable
+
+table = HudiPolarsTable.create(
+    "/tmp/trips_table",
+    "trips",
+    table_type="COPY_ON_WRITE",  # MERGE_ON_READ is also supported
+    record_key_fields=["uuid"],
+    partition_fields=["city"],
+    ordering_fields=["ts"],
+)
+
+table.write(
+    pl.DataFrame(
+        {
+            "uuid": ["1", "2"],
+            "city": ["santiago", "valparaiso"],
+            "ts": [1, 1],
+            "fare": [10.0, 20.0],
+        }
+    ),
+    mode="append",
+)
+
+# Existing keys are updated; new keys are inserted.
+table.write(
+    pl.DataFrame(
+        {
+            "uuid": ["2", "3"],
+            "city": ["valparaiso", "concepcion"],
+            "ts": [2, 1],
+            "fare": [25.0, 30.0],
+        }
+    ).lazy(),
+    mode="upsert",
+)
+
+result: pl.DataFrame = table.read()
+```
+
+The adapter also exposes `append`, `upsert`, `overwrite`,
+`dynamic_partition_overwrite`, `update`, `delete`, and streaming reads. The
+native `HudiTable` API accepts `list[pyarrow.RecordBatch]` for the same write
+operations when Polars is not needed. See
+[docs/python-polars.md](docs/python-polars.md) for the current constraints.
 
 ### Create a Table
 

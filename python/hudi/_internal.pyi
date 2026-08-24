@@ -249,6 +249,25 @@ class HudiInstant:
     @property
     def epoch_mills(self) -> int: ...
 
+@dataclass(init=False, frozen=True)
+class HudiAppendResult:
+    """Result of an append write."""
+
+    instant: str
+    commit_relative_path: str
+    base_file_path: str
+    num_rows: int
+
+@dataclass(init=False, frozen=True)
+class HudiWriteResult:
+    """Result of an upsert, delete, update, or overwrite write."""
+
+    instant: str
+    num_writes: int
+    num_updates: int
+    num_inserts: int
+    num_deletes: int
+
 @dataclass(init=False)
 class HudiTable:
     """
@@ -271,6 +290,25 @@ class HudiTable:
             base_uri (str): The base URI of the Hudi table.
             options (Optional[Dict[str, str]]): Additional configuration options (optional).
         """
+        ...
+    @staticmethod
+    def create(
+        base_uri: str,
+        table_name: str,
+        table_type: str = "COPY_ON_WRITE",
+        record_key_fields: Optional[List[str]] = None,
+        partition_fields: Optional[List[str]] = None,
+        ordering_fields: Optional[List[str]] = None,
+        table_version: int = 9,
+        metadata_enabled: bool = True,
+        record_index_enabled: Optional[bool] = None,
+        column_stats_enabled: Optional[bool] = None,
+        partition_stats_enabled: Optional[bool] = None,
+        hive_style_partitioning: bool = True,
+        hudi_options: Optional[Dict[str, str]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> "HudiTable":
+        """Create a new Hudi table and return an open handle."""
         ...
     def hudi_options(self) -> Dict[str, str]:
         """
@@ -434,6 +472,33 @@ class HudiTable:
         Streaming read; dispatches on ``options.query_type``. Incremental streaming
         is not yet supported and raises ``HudiCoreError``.
         """
+        ...
+    def append(self, batches: List["pyarrow.RecordBatch"]) -> HudiAppendResult:
+        """Append batches as a new insert commit."""
+        ...
+    def append_only(self, batches: List["pyarrow.RecordBatch"]) -> HudiAppendResult:
+        """Append batches to a strict append-only table."""
+        ...
+    def upsert(
+        self,
+        batches: List["pyarrow.RecordBatch"],
+        update_columns: Optional[List[str]] = None,
+    ) -> HudiWriteResult:
+        """Upsert complete records, or selected columns on copy-on-write tables."""
+        ...
+    def overwrite(self, batches: List["pyarrow.RecordBatch"]) -> HudiWriteResult:
+        """Replace all rows in the table."""
+        ...
+    def dynamic_partition_overwrite(
+        self, batches: List["pyarrow.RecordBatch"]
+    ) -> HudiWriteResult:
+        """Replace only the partitions represented by the input batches."""
+        ...
+    def delete(self, filter: str) -> HudiWriteResult:
+        """Delete rows matching a Hudi write-filter expression."""
+        ...
+    def update(self, filter: str, updates: "pyarrow.RecordBatch") -> HudiWriteResult:
+        """Update matching rows from a single-row record batch."""
         ...
 
 @dataclass(init=False)

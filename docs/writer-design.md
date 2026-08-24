@@ -43,7 +43,8 @@ design as implemented in `crates/core/src/write/`.
 
 **Not yet implemented**
 
-- Write bindings for Python / C++ / DataFusion (the read path covers those).
+- Write bindings for C++ / DataFusion. Python bindings accept PyArrow record
+  batches, with an optional Polars adapter layered on the Arrow boundary.
 - Table services as *drivers* (hudi-rs interoperates with Spark-run
   compaction, clustering, and cleaning, but does not schedule or execute them
   natively).
