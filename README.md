@@ -317,14 +317,18 @@ ArrowArrayStream* stream_ptr = reader->read_file_slice_from_paths("relative/path
 
 ## Writing Tables
 
-hudi-rs includes a native, single-node write path that is storage-compatible
+hudi-rs includes a native, Arrow-first write path that is storage-compatible
 with the Apache Hudi Spark writer: tables written here are readable — and
 serviceable (compaction, clustering, cleaning) — by Spark, and vice versa.
 Writes target COPY_ON_WRITE and MERGE_ON_READ tables at table version 9
 (Hudi 1.1.x; version 8 via `with_table_version(8)`), and maintain the
 metadata table (file listings, column/partition stats, record-level index) on
 every commit. See [docs/writer-design.md](docs/writer-design.md) for the full
-design.
+design. Independent writers can use operation-aware optimistic concurrency
+control (file-group deletes/upserts, partition-scoped dynamic overwrite, and
+table-scoped full overwrite) with a conditional-write storage lock on S3, GCS,
+or Azure; see
+[docs/concurrent-writers.md](docs/concurrent-writers.md).
 
 Python write bindings accept PyArrow record batches directly. Install the
 optional Polars adapter with `pip install 'hudi[polars]'` to read and write

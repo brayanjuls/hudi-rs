@@ -35,6 +35,7 @@ pub mod read;
 pub mod read_options;
 pub mod table;
 pub mod util;
+pub mod write;
 
 pub use read_options::{QueryType, ReadOptions};
 

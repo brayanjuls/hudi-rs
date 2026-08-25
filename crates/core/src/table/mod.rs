@@ -199,6 +199,24 @@ fn instant_time_minus_one(instant_time: &str) -> String {
 }
 
 impl Table {
+    #[cfg(test)]
+    pub(crate) async fn new_with_storage_for_test(
+        hudi_configs: Arc<HudiConfigs>,
+        storage: Arc<crate::storage::Storage>,
+    ) -> Result<Self> {
+        let timeline =
+            crate::timeline::builder::TimelineBuilder::new(hudi_configs.clone(), storage.clone())
+                .build()
+                .await?;
+        Ok(Self {
+            hudi_configs: hudi_configs.clone(),
+            storage_options: Arc::new(HashMap::new()),
+            timeline,
+            file_system_view: FileSystemView::new_with_storage(hudi_configs, storage),
+            cached_estimator: Arc::new(OnceCell::new()),
+        })
+    }
+
     /// Open a fresh metadata-table handle from storage (no instance cache).
     ///
     /// Writers and readers reload the data timeline first, then open MDT relative
@@ -211,12 +229,17 @@ impl Table {
     /// Reload the active timeline and drop listing caches before a write plans.
     pub(crate) async fn reload_timeline_for_write(&mut self) -> Result<()> {
         crate::write::ensure_writable_table_version(self)?;
-        // Instants must be minted in the table's declared timeline timezone
-        // (Spark writers default to LOCAL); set before any instant is minted.
-        crate::write::set_commit_timezone(&self.timezone());
-        // Eager rollback of crashed writes (Java rollbackFailedWrites) before
-        // any new instant is minted.
-        crate::write::rollback::rollback_failed_writes(self).await?;
+        let concurrency =
+            crate::config::write::WriteConcurrencyConfig::from_configs(&self.hudi_configs)?;
+        // EAGER is safe only for the single-writer protocol. OCC requires
+        // LAZY so a writer never mistakes another active transaction for a
+        // crashed one. A conflicting OCC writer rolls back only its own
+        // instant while holding the commit lock.
+        if concurrency.failed_writes_cleaning_policy
+            == crate::config::write::FailedWritesCleaningPolicy::Eager
+        {
+            crate::write::rollback::rollback_failed_writes(self).await?;
+        }
         self.timeline.reload_completed_commits().await?;
         self.file_system_view.clear_cache();
         Ok(())

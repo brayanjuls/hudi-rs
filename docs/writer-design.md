@@ -39,7 +39,7 @@ design as implemented in `crates/core/src/write/`.
 - Metadata table (MDT) with `files`, `column_stats`, `partition_stats`, and
   `record_index` partitions, all enabled by default.
 - Marker-based rollback of failed writes, LSM timeline archival, in-process
-  locking.
+  single-writer locking, and file-group OCC with storage-based locking.
 
 **Not yet implemented**
 
@@ -48,8 +48,9 @@ design as implemented in `crates/core/src/write/`.
 - Table services as *drivers* (hudi-rs interoperates with Spark-run
   compaction, clustering, and cleaning, but does not schedule or execute them
   natively).
-- Multi-writer concurrency control beyond in-process locking; bootstrap
-  tables; CDC-format writes; `delete_partition`.
+- Marker-based early conflict detection; bootstrap tables; CDC-format writes;
+  `delete_partition`. Baseline multi-writer OCC and storage-based distributed
+  locking are described in [`concurrent-writers.md`](concurrent-writers.md).
 
 ## 2. Design principles
 
@@ -78,9 +79,10 @@ lock ─► generate completion time ─► complete data instant
 
 ### 3.1 Instants and time generation
 
-- `generate_instant_time` mints millisecond instants that are **monotonic
-  across the process** (a static high-water mark plus a short skew wait guards
-  against clock skew, mirroring Java's `TimeGenerator`).
+- `generate_instant_time` mints millisecond instants that are monotonic across
+  the process. While holding the table lock, writers also scan the active
+  timeline high-water mark so requested and completion instants remain ordered
+  across independent processes.
 - Instants are formatted in the table's declared
   `hoodie.table.timeline.timezone`. The default is `LOCAL`, matching the Spark
   writer, so interleaved writers on one host produce a correctly ordered
@@ -94,13 +96,15 @@ lock ─► generate completion time ─► complete data instant
 
 ### 3.2 Critical sections and locking
 
-`LockProvider` (`write/lock.rs`) abstracts locking with a single
-implementation, `InProcessLockProvider` (a per-base-path async mutex
-registry). Two short critical sections per write:
+`LockProvider` (`write/lock.rs`) abstracts locking. Single-writer mode uses
+`InProcessLockProvider` (a per-base-path async mutex registry); OCC can use the
+conditional-write `StorageBasedLockProvider`. Two short critical sections per
+write:
 
 1. **Request**: `lock → generate_instant_time → request_<action> → unlock`.
-2. **Complete**: `lock → generate_completion_time → complete_<action> →
-   marker cleanup + timeline archival → unlock`.
+2. **Complete**: `lock → validate post-snapshot conflicts →
+   generate_completion_time → complete_<action> → marker cleanup + timeline
+   archival → unlock`.
 
 The data-writing work between the two sections runs outside any lock.
 
@@ -124,10 +128,13 @@ reads.
   node): `.hoodie/.temp/{instant}/MARKERS{N}` files listing
   `{partition}/{file}.marker.{CREATE|MERGE}` entries, written before any data
   file.
-- Failed writes are rolled back **eagerly** on the next table load for write:
-  markers identify files to delete, orphan MDT deltacommits are removed, and a
-  rollback plan + metadata (Avro OCF) are written like the Java writer's
-  rollback action.
+- In single-writer `EAGER` mode, failed writes are rolled back on the next table
+  load for write: markers identify files to delete, orphan MDT deltacommits are
+  removed, and a rollback plan + metadata (Avro OCF) are written like the Java
+  writer's rollback action. OCC requires `LAZY`; each pending write refreshes
+  `.hoodie/.heartbeat/{instant}`, a conflicting writer rolls back only its own
+  instant, and a later writer rolls back abandoned instants only after their
+  heartbeat tolerance has expired.
 
 ### 3.5 LSM timeline archival
 
@@ -150,9 +157,9 @@ implemented natively.
 | `append` / `append_only` | Bulk-insert-like: new file groups per call, no index lookup, size-split into `hoodie.parquet.max.file.size` buckets. |
 | `upsert` / `upsert_with` | Index-tagged updates + inserts. Updates rewrite their file group (COW) or append log blocks to their file slice (MOR). Inserts pack into existing small files first. |
 | `update` | SQL-style column update on rows matching a filter. |
-| `delete` / `delete_keys` | Filter- or key-based deletes. A file group left empty still receives an empty base file version so the deletion is durable for all readers. |
-| `overwrite` | `INSERT_OVERWRITE_TABLE`: replaces all file groups via a replacecommit. |
-| `dynamic_partition_overwrite` | `INSERT_OVERWRITE`: replaces only the partitions present in the input. |
+| `delete` / `delete_keys` | Filter- or key-based deletes. A file group left empty still receives an empty base file version so the deletion is durable for all readers. Concurrent deletes conflict at file-group scope. |
+| `overwrite` | `INSERT_OVERWRITE_TABLE`: replaces all file groups via a replacecommit and conflicts with every post-snapshot data action. |
+| `dynamic_partition_overwrite` | `INSERT_OVERWRITE`: replaces only the partitions present in the input and conflicts with every post-snapshot write in those partitions. |
 
 ### 4.2 Indexing
 
@@ -194,8 +201,9 @@ strategy id. Written partitions:
 - **files** — per-partition file listings plus `__all_partitions__`.
 - **column_stats** — per file × column, V2 encoding at table version 9
   (typed primitive wrappers + `valueType`), tight-bound.
-- **partition_stats** — per partition × column, recomputed tight-bound on
-  each write.
+- **partition_stats** — per partition × column, recomputed tight-bound after
+  OCC validation under the commit lock so disjoint concurrent writers in the
+  same partition cannot overwrite one another's aggregate range.
 - **record_index** — record key → file group location, 10 shards.
 
 Reading merges base HFile records with log records using

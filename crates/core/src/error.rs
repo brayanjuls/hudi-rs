@@ -97,6 +97,10 @@ pub enum CoreError {
     #[error("Write error: {0}")]
     Write(String),
 
+    /// A concurrent commit modified at least one file group in this write set.
+    #[error("Write conflict: {0}")]
+    WriteConflict(String),
+
     #[error(transparent)]
     Utf8Error(#[from] std::str::Utf8Error),
 }

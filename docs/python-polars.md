@@ -62,6 +62,66 @@ table.upsert(
 result = table.read()
 ```
 
+## Concurrent writers on S3
+
+Every independent writer must open the table with the same OCC and lock
+configuration. The storage lock uses S3 conditional puts against
+`.hoodie/.locks/table_lock.json`; credentials and region are supplied through
+the normal `object_store` options, environment variables, or the AWS workload
+identity/instance role.
+
+```python
+import os
+
+import polars as pl
+
+from hudi.polars import HudiPolarsTable
+
+OCC_OPTIONS = {
+    "hoodie.write.concurrency.mode": "optimistic_concurrency_control",
+    "hoodie.write.lock.provider": (
+        "org.apache.hudi.client.transaction.lock.StorageBasedLockProvider"
+    ),
+    "hoodie.cleaner.policy.failed.writes": "LAZY",
+}
+
+table = HudiPolarsTable.open(
+    "s3://my-bucket/lake/trips",
+    hudi_options=OCC_OPTIONS,
+    storage_options={"aws_region": os.environ["AWS_REGION"]},
+)
+
+table.upsert(
+    pl.DataFrame(
+        {
+            "id": ["a"],
+            "city": ["santiago"],
+            "ts": [3],
+            "fare": [12.0],
+        }
+    )
+)
+```
+
+For a local S3-compatible endpoint such as RustFS or MinIO, add the endpoint
+and path-style HTTP settings. Credentials can remain in `AWS_ACCESS_KEY_ID`
+and `AWS_SECRET_ACCESS_KEY`:
+
+```python
+storage_options = {
+    "aws_endpoint_url": "http://127.0.0.1:9000",
+    "aws_allow_http": "true",
+    "aws_region": "us-east-1",
+    "aws_virtual_hosted_style_request": "false",
+}
+```
+
+Use unique Hudi record keys across independent append-only producers when the
+application requires key uniqueness: the default Apache Hudi conflict strategy
+detects file-group overlap, not two inserts of the same record key into two new
+file groups. See [Concurrent Writers and Optimistic Concurrency
+Control](concurrent-writers.md) for the protocol and tuning options.
+
 The adapter materializes a `LazyFrame` before writing. Reads return a
 `DataFrame`; `read_stream()` yields one `DataFrame` per Arrow batch. It is not
 yet a native Polars lazy scan source, so Polars expressions are not pushed into
@@ -70,8 +130,11 @@ pushdown.
 
 ## Current constraints
 
-- The native writer is single-node and single-writer. External lock providers
-  and optimistic concurrency control are not implemented.
+- Each writer is single-node, but independent writers can use operation-aware
+  OCC with the storage-based lock on S3, GCS, or Azure. Deletes and ordinary
+  updates conflict by file group, dynamic overwrite by target partition, and
+  full overwrite across the table. Local filesystems do not provide the
+  conditional-update primitive required by this lock provider.
 - Record keys must currently be a single Arrow `string` field. Complex keys,
   non-string keys, and additional key generators are not implemented.
 - Write-side schema evolution rejects changes beyond nullability alignment.

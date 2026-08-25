@@ -550,13 +550,7 @@ fn stats_index_version(table: &Table) -> StatsIndexVersion {
     }
 }
 
-/// Update MDT `column_stats` and `partition_stats` for written files.
-///
-/// Partition stats follow Java `convertMetadataToPartitionStatRecords`: for each
-/// touched partition, recompute a tight-bound aggregate over this commit's new
-/// files plus the existing MDT `column_stats` of all files still in the latest
-/// file slices. `replaced_files` lists relative paths superseded by this commit
-/// (COW rewrites / replacecommits) to exclude from that scan.
+/// Update MDT `column_stats` for written files.
 ///
 /// Returns per-MDT-partition write stats for the caller's single MDT
 /// deltacommit (see [`write_metadata_commit`]).
@@ -565,7 +559,7 @@ pub async fn update_column_stats_partitions(
     instant: &str,
     updates: &[StatsFileUpdate],
     schema: &Schema,
-    replaced_files: &[String],
+    _replaced_files: &[String],
 ) -> Result<HashMap<String, Vec<HoodieWriteStat>>> {
     let mut out: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
     if updates.is_empty() {
@@ -617,31 +611,50 @@ pub async fn update_column_stats_partitions(
         );
     }
 
-    if is_partition_stats_enabled(table) {
-        let partition_records =
-            compute_partition_stats_records(table, updates, &indexed_columns, replaced_files)
-                .await?;
-        if !partition_records.is_empty() {
-            let stats = write_stats_log_blocks(
-                data_storage.as_ref(),
-                instant,
-                MetadataPartitionType::PartitionStats.partition_name(),
-                "partition-stats-",
-                DEFAULT_PARTITION_STATS_NUM_FILE_GROUPS,
-                &partition_stats_file_id,
-                &partition_records,
-                false,
-                stats_index_version(table),
-            )
-            .await?;
-            out.insert(
-                MetadataPartitionType::PartitionStats
-                    .partition_name()
-                    .to_string(),
-                stats,
-            );
-        }
+    Ok(out)
+}
+
+/// Recompute tight `partition_stats` after OCC validation while CS2 is held.
+///
+/// This must observe the latest completed file-system view. Computing it in
+/// the unlocked work phase lets two disjoint writers in one partition both
+/// publish aggregates derived from the same stale predecessor, causing the
+/// later MDT log block to erase the earlier writer's range.
+pub async fn update_partition_stats(
+    table: &Table,
+    instant: &str,
+    updates: &[StatsFileUpdate],
+    schema: &Schema,
+    replaced_files: &[String],
+) -> Result<HashMap<String, Vec<HoodieWriteStat>>> {
+    let mut out = HashMap::new();
+    if updates.is_empty() || !is_partition_stats_enabled(table) {
+        return Ok(out);
     }
+    let indexed_columns = columns_to_index(&crate::write::append::schema_with_meta_fields(schema));
+    let partition_records =
+        compute_partition_stats_records(table, updates, &indexed_columns, replaced_files).await?;
+    if partition_records.is_empty() {
+        return Ok(out);
+    }
+    let stats = write_stats_log_blocks(
+        table.file_system_view.storage.as_ref(),
+        instant,
+        MetadataPartitionType::PartitionStats.partition_name(),
+        "partition-stats-",
+        DEFAULT_PARTITION_STATS_NUM_FILE_GROUPS,
+        &partition_stats_file_id,
+        &partition_records,
+        false,
+        stats_index_version(table),
+    )
+    .await?;
+    out.insert(
+        MetadataPartitionType::PartitionStats
+            .partition_name()
+            .to_string(),
+        stats,
+    );
     Ok(out)
 }
 
@@ -1078,7 +1091,11 @@ pub(crate) async fn write_metadata_commit(
     };
     // Completion time is minted at completion, after the requested time (Java
     // generates it through the same monotonic skew-adjusting time generator).
-    let completion = crate::write::append::generate_instant_time().await;
+    let completion = crate::write::append::generate_instant_time_in_timezone_after(
+        &timeline_timezone(&storage.hudi_configs),
+        Some(instant),
+    )
+    .await;
     let completed_path = format!("{timeline}/{instant}_{completion}.deltacommit");
     storage
         .put_file_if_absent(&completed_path, metadata.to_avro_bytes()?)
