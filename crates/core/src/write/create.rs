@@ -201,8 +201,11 @@ impl TableCreateBuilder {
     }
 
     /// Create the table layout on storage and open a [`Table`] handle.
-    pub async fn create(self) -> Result<Table> {
-        let table_name = self.table_name.ok_or_else(|| {
+    pub async fn create(mut self) -> Result<Table> {
+        // Match TableBuilder: cloud credentials and endpoint settings may be
+        // supplied through AWS_*, AZURE_*, GOOGLE_*, or HOODIE_ENV_* variables.
+        Storage::extend_options_from_env(&mut self.storage_options);
+        let table_name = self.table_name.take().ok_or_else(|| {
             CoreError::Write("Table name is required to create a Hudi table".to_string())
         })?;
         // Property files are line-oriented; control characters in the name
@@ -326,7 +329,6 @@ impl TableCreateBuilder {
             .get(HudiTableConfig::TimelineTimezone.as_ref())
             .cloned()
             .unwrap_or_else(|| "LOCAL".to_string());
-        crate::write::set_commit_timezone(&timeline_timezone);
         props.insert(
             HudiTableConfig::TimelineTimezone.as_ref().to_string(),
             timeline_timezone,

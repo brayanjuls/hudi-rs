@@ -33,7 +33,7 @@ use crate::metadata::rollback::{
 };
 use crate::storage::Storage;
 use crate::table::Table;
-use crate::write::append::{generate_instant_time, is_layout_two, timeline_dir};
+use crate::write::append::{generate_instant_time_for_table, is_layout_two, timeline_dir};
 use crate::write::markers::{delete_marker_dir, parse_marker_name, read_markers};
 
 const METADATA_BASE: &str = ".hoodie/metadata";
@@ -57,6 +57,93 @@ pub(crate) async fn rollback_failed_writes(table: &Table) -> Result<()> {
     let pending = find_pending_instants(storage.as_ref(), &timeline).await?;
     for instant in pending {
         rollback_instant(table, storage.as_ref(), &timeline, &instant).await?;
+    }
+    Ok(())
+}
+
+/// Roll back one pending instant owned by the current OCC transaction.
+///
+/// Unlike [`rollback_failed_writes`], this never scans-and-rolls-back other
+/// writers. The caller must hold the table lock.
+pub(crate) async fn rollback_failed_instant(table: &Table, instant: &str) -> Result<()> {
+    let storage = table.file_system_view.storage.clone();
+    let timeline = timeline_dir(table);
+    let pending = find_pending_instants(storage.as_ref(), &timeline).await?;
+    if let Some(pending) = pending
+        .into_iter()
+        .find(|pending| pending.timestamp == instant)
+    {
+        rollback_instant(table, storage.as_ref(), &timeline, &pending).await?;
+    }
+    Ok(())
+}
+
+/// Roll back only LAZY-policy writes whose standard Hudi heartbeat has expired.
+///
+/// The caller holds the table lock. A present, recent heartbeat always wins;
+/// missing heartbeats are treated as abandoned, matching Java's failed-write
+/// cleanup contract.
+pub(crate) async fn rollback_expired_failed_writes(table: &Table) -> Result<()> {
+    let config = crate::config::write::WriteConcurrencyConfig::from_configs(&table.hudi_configs)?;
+    if config.failed_writes_cleaning_policy
+        != crate::config::write::FailedWritesCleaningPolicy::Lazy
+    {
+        return Ok(());
+    }
+    let storage = table.file_system_view.storage.clone();
+    let timeline = timeline_dir(table);
+    let tolerance_ms = i64::try_from(config.client_heartbeat_interval_ms)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(
+            i64::try_from(config.client_heartbeat_tolerable_misses).unwrap_or(i64::MAX),
+        );
+    let now = chrono::Utc::now();
+    for pending in find_pending_instants(storage.as_ref(), &timeline).await? {
+        let heartbeat = format!(".hoodie/.heartbeat/{}", pending.timestamp);
+        let expired = match storage.file_last_modified(&heartbeat).await? {
+            Some(last_modified) => {
+                now.signed_duration_since(last_modified).num_milliseconds() > tolerance_ms
+            }
+            None => true,
+        };
+        if !expired {
+            continue;
+        }
+        rollback_instant(table, storage.as_ref(), &timeline, &pending).await?;
+        let _ = storage.delete_file(&heartbeat).await;
+    }
+    // An ambiguous completion can leave a heartbeat whose data instant is in
+    // fact completed (and therefore is not a rollback candidate). Remove any
+    // expired heartbeat left without a pending instant so these objects do not
+    // accumulate indefinitely.
+    let remaining_pending: std::collections::HashSet<String> =
+        find_pending_instants(storage.as_ref(), &timeline)
+            .await?
+            .into_iter()
+            .map(|pending| pending.timestamp)
+            .collect();
+    let heartbeat_dir = ".hoodie/.heartbeat";
+    let heartbeat_files = match storage.list_files(Some(heartbeat_dir)).await {
+        Ok(files) => files,
+        Err(crate::storage::error::StorageError::ObjectStoreError(
+            object_store::Error::NotFound { .. },
+        )) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    for file in heartbeat_files {
+        if remaining_pending.contains(&file.name) {
+            continue;
+        }
+        let path = format!("{heartbeat_dir}/{}", file.name);
+        let expired = storage
+            .file_last_modified(&path)
+            .await?
+            .is_none_or(|last_modified| {
+                now.signed_duration_since(last_modified).num_milliseconds() > tolerance_ms
+            });
+        if expired {
+            let _ = storage.delete_file(&path).await;
+        }
     }
     Ok(())
 }
@@ -114,6 +201,15 @@ async fn find_pending_instants(
             completed.insert(timestamp);
         }
     }
+    let unresolved = fenced
+        .keys()
+        .filter(|timestamp| !completed.contains(*timestamp))
+        .cloned()
+        .collect();
+    completed.extend(
+        crate::write::archival::archived_instant_times_matching(storage, timeline_dir, &unresolved)
+            .await?,
+    );
     let mut pending: Vec<PendingInstant> = fenced
         .into_iter()
         .filter(|(ts, _)| !completed.contains(ts))
@@ -196,7 +292,7 @@ async fn rollback_instant(
     }
 
     // Rollback plan + lifecycle on its own (new) instant.
-    let rollback_ts = generate_instant_time().await;
+    let rollback_ts = generate_instant_time_for_table(table).await?;
     let plan = HoodieRollbackPlan {
         instant_to_rollback: Some(HoodieInstantInfo {
             commit_time: failed_ts.clone(),
@@ -239,7 +335,7 @@ async fn rollback_instant(
         }],
     };
     let completion = if is_layout_two(table) {
-        generate_instant_time().await
+        generate_instant_time_for_table(table).await?
     } else {
         rollback_ts.clone()
     };
@@ -270,51 +366,53 @@ async fn rollback_instant(
     Ok(())
 }
 
-/// Delete a completed-but-orphaned MDT deltacommit for a failed data instant:
-/// its instant-named log files in every MDT partition, then its timeline files.
-/// (Java rolls the MDT deltacommit back via the MDT write client; deletion is
-/// the single-writer equivalent — the log files are per-instant, never shared.)
+/// Delete MDT artifacts for a failed data instant: its instant-named log files
+/// in every MDT partition, then any timeline files.
+///
+/// The log blocks are written before OCC validation, so a conflicting writer
+/// can have MDT logs without an MDT deltacommit. They are per-instant and never
+/// shared, making targeted deletion safe in both the pending and orphaned-
+/// completion cases.
 async fn rollback_orphan_mdt_commit(storage: &Storage, failed_ts: &str) -> Result<()> {
     let mdt_timeline = format!("{METADATA_BASE}/.hoodie/timeline");
     let timeline_files = match storage.list_files(Some(&mdt_timeline)).await {
         Ok(files) => files,
         Err(crate::storage::error::StorageError::ObjectStoreError(
             object_store::Error::NotFound { .. },
-        )) => return Ok(()),
+        )) => Vec::new(),
         Err(error) => return Err(error.into()),
     };
     let mut mdt_instant_files = Vec::new();
-    let mut has_completed = false;
     for file in timeline_files {
         let name = file.name;
         let matches_instant = name.starts_with(&format!("{failed_ts}_"))
             || name.starts_with(&format!("{failed_ts}."));
         if matches_instant {
-            if name.ends_with(".deltacommit") {
-                has_completed = true;
-            }
             mdt_instant_files.push(name);
         }
     }
-    if mdt_instant_files.is_empty() {
-        return Ok(());
-    }
-    if has_completed {
-        // Delete the failed instant's log blocks from every MDT partition.
-        let partitions = storage.list_dirs(Some(METADATA_BASE)).await?;
-        for partition in partitions {
-            if partition == ".hoodie" {
-                continue;
-            }
-            let dir = format!("{METADATA_BASE}/{partition}");
-            let Ok(files) = storage.list_files(Some(&dir)).await else {
-                continue;
-            };
-            for file in files {
-                // MDT log files embed the data instant: `.{fileId}_{ts}.log.N_...`.
-                if file.name.contains(&format!("_{failed_ts}.log.")) {
-                    let _ = storage.delete_file(&format!("{dir}/{}", file.name)).await;
-                }
+
+    // Delete the failed instant's log blocks from every MDT partition even if
+    // OCC rejected the write before an MDT timeline instant was published.
+    let partitions = match storage.list_dirs(Some(METADATA_BASE)).await {
+        Ok(partitions) => partitions,
+        Err(crate::storage::error::StorageError::ObjectStoreError(
+            object_store::Error::NotFound { .. },
+        )) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    for partition in partitions {
+        if partition == ".hoodie" {
+            continue;
+        }
+        let dir = format!("{METADATA_BASE}/{partition}");
+        let Ok(files) = storage.list_files(Some(&dir)).await else {
+            continue;
+        };
+        for file in files {
+            // MDT log files embed the data instant: `.{fileId}_{ts}.log.N_...`.
+            if file.name.contains(&format!("_{failed_ts}.log.")) {
+                let _ = storage.delete_file(&format!("{dir}/{}", file.name)).await;
             }
         }
     }
@@ -379,6 +477,29 @@ mod lifecycle_tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn test_rollback_deletes_uncommitted_mdt_logs_without_timeline_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        let ts = "30000101000000000";
+        let mdt_partition = dir.path().join(".hoodie/metadata/files");
+        std::fs::create_dir_all(&mdt_partition).unwrap();
+        let log_name = format!(".files-0000-0_{ts}.log.1_0-0-0");
+        let log_path = mdt_partition.join(&log_name);
+        std::fs::write(&log_path, b"uncommitted").unwrap();
+
+        super::rollback_orphan_mdt_commit(table.file_system_view.storage.as_ref(), ts)
+            .await
+            .unwrap();
+
+        assert!(!log_path.exists());
+    }
+
     /// Fabricated crashed write (fencing + markers + partial file + orphan MDT
     /// deltacommit) rolled back by the next write, from inside the crate.
     #[tokio::test]
@@ -434,5 +555,36 @@ mod lifecycle_tests {
             })
             .count();
         assert_eq!(rollbacks, 1, "one completed rollback instant");
+    }
+
+    #[tokio::test]
+    async fn test_lazy_cleanup_rolls_back_only_missing_heartbeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_option("hoodie.write.concurrency.mode", "occ")
+            .with_option(
+                "hoodie.write.lock.provider",
+                crate::config::write::STORAGE_BASED_LOCK_PROVIDER_CLASS,
+            )
+            .with_option("hoodie.cleaner.policy.failed.writes", "LAZY")
+            .create()
+            .await
+            .unwrap();
+        let ts = "30000101000000000";
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::write(timeline.join(format!("{ts}.commit.requested")), b"").unwrap();
+        std::fs::write(timeline.join(format!("{ts}.inflight")), b"").unwrap();
+
+        super::rollback_expired_failed_writes(&table).await.unwrap();
+
+        assert!(!timeline.join(format!("{ts}.commit.requested")).exists());
+        assert!(!timeline.join(format!("{ts}.inflight")).exists());
+        assert!(std::fs::read_dir(&timeline).unwrap().any(|entry| {
+            entry
+                .ok()
+                .is_some_and(|entry| entry.file_name().to_string_lossy().ends_with(".rollback"))
+        }));
     }
 }

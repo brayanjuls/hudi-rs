@@ -306,23 +306,29 @@ pub(crate) async fn archive_timeline_if_needed(
         stale -= 1;
     }
 
-    // Remove archived instants from the active timeline: fencing files first
-    // (ascending), completed files after.
+    // Remove archived instants from the active timeline: fencing files first.
+    // A completed file is removed only after every fence is confirmed absent;
+    // otherwise a surviving fence can later be mistaken for a failed write
+    // and roll back data whose completion is already archived.
     for instant in &to_archive {
+        let mut fences_absent = true;
         for fencing in fencing_by_instant
             .get(&instant.requested)
             .into_iter()
             .flatten()
         {
+            let path = format!("{timeline_dir}/{fencing}");
+            if storage.delete_file(&path).await.is_err()
+                && !matches!(storage.file_last_modified(&path).await, Ok(None))
+            {
+                fences_absent = false;
+            }
+        }
+        if fences_absent {
             let _ = storage
-                .delete_file(&format!("{timeline_dir}/{fencing}"))
+                .delete_file(&format!("{timeline_dir}/{}", instant.file_name))
                 .await;
         }
-    }
-    for instant in &to_archive {
-        let _ = storage
-            .delete_file(&format!("{timeline_dir}/{}", instant.file_name))
-            .await;
     }
     Ok(())
 }
@@ -449,6 +455,143 @@ pub(crate) async fn archived_instant_times(
         }
     }
     Ok(out)
+}
+
+/// Archived requested times matching a small candidate set.
+///
+/// LAZY cleanup uses this to distinguish a stale fence for an already
+/// archived completion from a genuinely pending instant. LSM file names carry
+/// their requested-time bounds, so normal recent pending writers require only
+/// the manifest read and no history parquet downloads.
+pub(crate) async fn archived_instant_times_matching(
+    storage: &Storage,
+    timeline_dir: &str,
+    candidates: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>> {
+    if candidates.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let history_dir = format!("{timeline_dir}/history");
+    let (version, manifest) = read_manifest(storage, &history_dir).await?;
+    let mut out = std::collections::HashSet::new();
+    if version == 0 {
+        return Ok(out);
+    }
+    for entry in &manifest.files {
+        let mut parts = entry.file_name.split('_');
+        let (Some(minimum), Some(maximum)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.as_str() >= minimum && candidate.as_str() <= maximum)
+        {
+            continue;
+        }
+        let bytes = storage
+            .get_file_data(&format!("{history_dir}/{}", entry.file_name))
+            .await?;
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(bytes.to_vec()),
+        )
+        .map_err(|error| CoreError::Timeline(format!("open LSM parquet: {error}")))?
+        .build()
+        .map_err(|error| CoreError::Timeline(format!("read LSM parquet: {error}")))?;
+        for batch in reader {
+            let batch =
+                batch.map_err(|error| CoreError::Timeline(format!("read LSM batch: {error}")))?;
+            let Some(instants) = batch
+                .column_by_name("instantTime")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            else {
+                continue;
+            };
+            for index in 0..instants.len() {
+                if !instants.is_null(index) && candidates.contains(instants.value(index)) {
+                    out.insert(instants.value(index).to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A completed action retained in the layout-v2 LSM history timeline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArchivedInstantRecord {
+    pub requested: String,
+    pub completion: String,
+    pub action: String,
+    pub metadata: Vec<u8>,
+}
+
+/// Read completed action metadata from the layout-v2 LSM history timeline.
+///
+/// OCC uses this in addition to the active timeline because a long-running
+/// writer's snapshot boundary can be older than the active-timeline archive
+/// boundary by the time it reaches its commit critical section.
+pub(crate) async fn archived_instant_records(
+    storage: &Storage,
+    timeline_dir: &str,
+) -> Result<Vec<ArchivedInstantRecord>> {
+    let history_dir = format!("{timeline_dir}/history");
+    let (version, manifest) = read_manifest(storage, &history_dir).await?;
+    if version == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut records = HashMap::<(String, String), ArchivedInstantRecord>::new();
+    for entry in &manifest.files {
+        let bytes = storage
+            .get_file_data(&format!("{history_dir}/{}", entry.file_name))
+            .await?;
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(bytes.to_vec()),
+        )
+        .map_err(|error| CoreError::Timeline(format!("open LSM parquet: {error}")))?
+        .build()
+        .map_err(|error| CoreError::Timeline(format!("read LSM parquet: {error}")))?;
+        for batch in reader {
+            let batch =
+                batch.map_err(|error| CoreError::Timeline(format!("read LSM batch: {error}")))?;
+            let requested = batch
+                .column_by_name("instantTime")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>());
+            let completion = batch
+                .column_by_name("completionTime")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>());
+            let action = batch
+                .column_by_name("action")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>());
+            let metadata = batch
+                .column_by_name("metadata")
+                .and_then(|column| column.as_any().downcast_ref::<BinaryArray>());
+            let (Some(requested), Some(completion), Some(action), Some(metadata)) =
+                (requested, completion, action, metadata)
+            else {
+                continue;
+            };
+            for index in 0..batch.num_rows() {
+                if requested.is_null(index)
+                    || completion.is_null(index)
+                    || action.is_null(index)
+                    || metadata.is_null(index)
+                {
+                    continue;
+                }
+                let record = ArchivedInstantRecord {
+                    requested: requested.value(index).to_string(),
+                    completion: completion.value(index).to_string(),
+                    action: action.value(index).to_string(),
+                    metadata: metadata.value(index).to_vec(),
+                };
+                records.insert((record.requested.clone(), record.action.clone()), record);
+            }
+        }
+    }
+    let mut records: Vec<_> = records.into_values().collect();
+    records.sort_by(|left, right| left.completion.cmp(&right.completion));
+    Ok(records)
 }
 
 #[cfg(test)]

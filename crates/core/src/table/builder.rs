@@ -251,21 +251,7 @@ impl OptionResolver {
     ///
     /// [note] All keys will be converted to lowercase.
     fn resolve_env_vars(&mut self) {
-        for (env_key, env_value) in std::env::vars() {
-            let lower_option_key = if let Some(stripped) = env_key.strip_prefix("HOODIE_ENV_") {
-                Some(stripped.replace("_DOT_", ".").to_ascii_lowercase())
-            } else if Storage::CLOUD_STORAGE_PREFIXES
-                .iter()
-                .any(|prefix| env_key.starts_with(prefix))
-            {
-                Some(env_key.to_ascii_lowercase())
-            } else {
-                None
-            };
-            if let Some(key) = lower_option_key {
-                self.storage_options.entry(key).or_insert(env_value);
-            }
-        }
+        Storage::extend_options_from_env(&mut self.storage_options);
     }
 
     async fn resolve_hudi_options(&mut self) -> Result<()> {

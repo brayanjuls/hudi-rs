@@ -41,13 +41,13 @@ use crate::metadata::table::encode::RecordIndexEntry;
 use crate::table::{ReadOptions, Table};
 use crate::timeline::instant::{Action, Instant};
 use crate::write::append::{
-    ensure_copy_on_write, generate_instant_time, is_layout_two, prepare_batches_for_write,
-    timeline_dir,
+    ensure_copy_on_write, generate_instant_time_for_table, is_layout_two,
+    prepare_batches_for_write, timeline_dir,
 };
 use crate::write::keygen::{hoodie_keys_for_batch, relative_data_path};
 use crate::write::metadata::{
     instant_to_epoch_millis, is_column_stats_enabled, update_column_stats_partitions,
-    update_files_partition_entries, update_record_index,
+    update_files_partition_entries, update_partition_stats, update_record_index,
 };
 
 /// Result of an upsert, delete, or overwrite write.
@@ -86,14 +86,15 @@ enum RewriteKind {
 /// heavy work runs unlocked. `request_commit` / `request_replacecommit` pick
 /// the timeline action from the rewrite kind.
 async fn request_rewrite_instant(
-    table: &Table,
+    table: &mut Table,
     operation: &str,
     kind: RewriteKind,
-) -> Result<String> {
+) -> Result<crate::write::occ::PendingInstant> {
     let storage = table.file_system_view.storage.clone();
-    let lock = crate::write::lock::lock_provider_for(table);
-    let _cs1 = lock.lock().await?;
-    let instant = generate_instant_time().await;
+    let lock = crate::write::lock::lock_provider_for(table)?;
+    let cs1 = lock.lock().await?;
+    let instant = generate_instant_time_for_table(table).await?;
+    let instant = crate::write::occ::begin_transaction(table, &instant).await?;
     let action = match kind {
         RewriteKind::Commit => Action::Commit,
         RewriteKind::Replace => Action::ReplaceCommit,
@@ -104,6 +105,7 @@ async fn request_rewrite_instant(
     } else {
         Vec::new()
     };
+    cs1.validate().await?;
     crate::write::fence_timeline_instant(
         storage.as_ref(),
         &timeline_dir(table),
@@ -113,15 +115,21 @@ async fn request_rewrite_instant(
         crate::write::inflight_commit_metadata_bytes(operation, is_layout_two(table))?,
     )
     .await?;
+    cs1.release().await?;
     Ok(instant)
 }
 
 /// Critical section 1 for MOR deltacommits.
-async fn request_deltacommit(table: &Table, operation: &str) -> Result<String> {
+async fn request_deltacommit(
+    table: &mut Table,
+    operation: &str,
+) -> Result<crate::write::occ::PendingInstant> {
     let storage = table.file_system_view.storage.clone();
-    let lock = crate::write::lock::lock_provider_for(table);
-    let _cs1 = lock.lock().await?;
-    let instant = generate_instant_time().await;
+    let lock = crate::write::lock::lock_provider_for(table)?;
+    let cs1 = lock.lock().await?;
+    let instant = generate_instant_time_for_table(table).await?;
+    let instant = crate::write::occ::begin_transaction(table, &instant).await?;
+    cs1.validate().await?;
     crate::write::fence_timeline_instant(
         storage.as_ref(),
         &timeline_dir(table),
@@ -131,6 +139,7 @@ async fn request_deltacommit(table: &Table, operation: &str) -> Result<String> {
         crate::write::inflight_commit_metadata_bytes(operation, is_layout_two(table))?,
     )
     .await?;
+    cs1.release().await?;
     Ok(instant)
 }
 
@@ -168,6 +177,7 @@ pub async fn upsert_batches(
     }
     crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
+    validate_write_input(table, batches, "upsert").await?;
     let incoming = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let incoming = concat(&incoming)?;
     let key_name = record_key_name(table, &incoming)?;
@@ -446,7 +456,9 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
 
     if table.is_mor() {
         ensure_mor_merge_supported(table)?;
+        let instant = request_deltacommit(table, "DELETE").await?;
         let Some((old, _, _, _)) = data_for_filter_matches(table, &filter).await? else {
+            abort_requested_instant(table, &instant, Action::DeltaCommit).await?;
             return Ok(WriteResult::default());
         };
         let mask = filters_to_row_mask(&[filter], &old)?;
@@ -468,9 +480,10 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
             })
             .collect::<Vec<_>>();
         if delete_key_list.is_empty() {
+            abort_requested_instant(table, &instant, Action::DeltaCommit).await?;
             return Ok(WriteResult::default());
         }
-        return mor_delete_keys(table, &delete_key_list).await;
+        return mor_delete_keys_at_instant(table, &delete_key_list, instant).await;
     }
 
     // COW scan path — any column; no configured record key required. Each
@@ -480,6 +493,8 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
     let schema = table.get_schema_with_meta_fields().await?;
     validate_fields_against_schemas(std::slice::from_ref(&filter), [&schema])?;
     let instant = request_rewrite_instant(table, "DELETE", RewriteKind::Commit).await?;
+    let schema = table.get_schema_with_meta_fields().await?;
+    validate_fields_against_schemas(std::slice::from_ref(&filter), [&schema])?;
     let plans = merge_plans_for_slices(
         table,
         &instant,
@@ -554,6 +569,8 @@ pub async fn update_filter(
         ));
     }
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
+    let schema = table.get_schema_with_meta_fields().await?;
+    validate_fields_against_schemas(std::slice::from_ref(&filter), [&schema])?;
     let plans = merge_plans_for_slices(
         table,
         &instant,
@@ -593,6 +610,7 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         return mor_delete_keys(table, delete_keys).await;
     }
     ensure_rewrite_supported(table)?;
+    let instant = request_rewrite_instant(table, "DELETE", RewriteKind::Commit).await?;
     let locations = crate::index::for_table_checked(table)
         .await
         .tag_location(table, delete_keys)
@@ -602,6 +620,7 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         .filter_map(|loc| loc.as_ref().map(|l| l.file_id.clone()))
         .collect::<HashSet<_>>();
     if affected_file_ids.is_empty() {
+        abort_requested_instant(table, &instant, Action::Commit).await?;
         return Ok(WriteResult::default());
     }
     let requested_exact = std::sync::Arc::new(
@@ -618,7 +637,6 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
             .map(|key| key.record_key.clone())
             .collect::<HashSet<_>>(),
     );
-    let instant = request_rewrite_instant(table, "DELETE", RewriteKind::Commit).await?;
     let plans = merge_plans_for_slices(
         table,
         &instant,
@@ -804,10 +822,11 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
     // Listing enumerates the replaced groups; their record keys are read
     // (key column only) afterwards to tombstone dropped index entries.
     crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
-    let (file_ids, old_paths, log_only, replaced_slices, replaced_log_paths) =
-        replaced_groups_from_listing(table, None).await?;
     let instant =
         request_rewrite_instant(table, "INSERT_OVERWRITE_TABLE", RewriteKind::Replace).await?;
+    validate_write_input(table, batches, "overwrite").await?;
+    let (file_ids, old_paths, log_only, replaced_slices, replaced_log_paths) =
+        replaced_groups_from_listing(table, None).await?;
     let file_id = crate::write::new_file_id();
     let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
     let batches = prepare_batches_for_write(&table.hudi_configs, batches, &instant, &file_name)?;
@@ -878,6 +897,7 @@ pub async fn dynamic_partition_overwrite_batches(
         ));
     }
     let instant = request_rewrite_instant(table, "INSERT_OVERWRITE", RewriteKind::Replace).await?;
+    validate_write_input(table, batches, "dynamic_partition_overwrite").await?;
     let prepared = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let replacement = concat(&prepared)?;
     let (file_ids, old_paths, log_only, replaced_slices, replaced_log_paths) =
@@ -1121,6 +1141,15 @@ async fn mor_upsert_batches(
     batches: &[RecordBatch],
     options: UpsertOptions,
 ) -> Result<WriteResult> {
+    mor_upsert_batches_at_instant(table, batches, options, None).await
+}
+
+async fn mor_upsert_batches_at_instant(
+    table: &mut Table,
+    batches: &[RecordBatch],
+    options: UpsertOptions,
+    requested_instant: Option<crate::write::occ::PendingInstant>,
+) -> Result<WriteResult> {
     ensure_mor_merge_supported(table)?;
     if options.update_columns.is_some() {
         return Err(CoreError::Unsupported(
@@ -1163,7 +1192,24 @@ async fn mor_upsert_batches(
         &table.hudi_configs,
         std::slice::from_ref(&incoming),
     )?;
-    let instant = request_deltacommit(table, "UPSERT").await?;
+    let instant = match requested_instant {
+        Some(instant) => instant,
+        None => request_deltacommit(table, "UPSERT").await?,
+    };
+    // Re-check after CS1 refreshed the snapshot used by all index and slice
+    // planning below.
+    if table
+        .timeline
+        .get_latest_commit_timestamp_as_option()
+        .is_some()
+    {
+        let table_schema = std::sync::Arc::new(table.get_schema_with_meta_fields().await?);
+        if crate::write::align_batch_to_schema(&schema_check_batches[0], &table_schema).is_none() {
+            return Err(CoreError::Schema(
+                "upsert batch schema does not match the current table schema".to_string(),
+            ));
+        }
+    }
     let tagged_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, Some(&instant))?;
     let incoming_keys = keys(&incoming, &key_name)?;
     let locations = mor_file_locations(table, &tagged_keys).await?;
@@ -1556,7 +1602,7 @@ async fn mor_upsert_batches(
                 props.clone(),
                 plan.prepared.clone(),
                 plan.log_file.clone(),
-                instant.clone(),
+                instant.to_string(),
                 schema_json,
                 collect_ranges,
             ))
@@ -1654,33 +1700,46 @@ async fn mor_upsert_batches(
         }
     }
     // Critical section 2: complete deltacommit + MDT, then bookkeeping.
-    let lock = crate::write::lock::lock_provider_for(table);
+    let commit_bytes =
+        deltacommit_metadata_bytes(table, "UPSERT", &stats, incoming.schema().as_ref())?;
+    let lock = crate::write::lock::lock_provider_for(table)?;
     let cs2 = lock.lock().await?;
+    cs2.validate().await?;
+    crate::write::occ::validate_transaction(table, &instant, Action::DeltaCommit, &commit_bytes)
+        .await?;
+    if table.is_metadata_table_enabled() && !stats_updates.is_empty() {
+        table.timeline.reload_completed_commits().await?;
+        table.file_system_view.clear_cache();
+        mdt_stats.extend(
+            update_partition_stats(
+                table,
+                &instant,
+                &stats_updates,
+                incoming.schema().as_ref(),
+                &[],
+            )
+            .await?,
+        );
+    }
     if table.is_metadata_table_enabled()
         && let Err(error) =
             crate::write::metadata::write_metadata_commit(storage.as_ref(), &instant, mdt_stats)
                 .await
     {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
         return Err(error);
     }
-    if let Err(error) =
-        complete_deltacommit(table, &instant, "UPSERT", stats, incoming.schema().as_ref()).await
-    {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
+    cs2.validate().await?;
+    complete_deltacommit(table, &instant, "UPSERT", stats, incoming.schema().as_ref()).await?;
     // Durable from here: best-effort maintenance must not fail the write.
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
-    drop(cs2);
+    crate::write::occ::finish_transaction(table, &instant).await;
+    if let Err(error) = cs2.release().await {
+        log::warn!("commit succeeded but releasing the table lock failed: {error}");
+    }
     let _ = table.timeline.reload_completed_commits().await;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
-        instant,
+        instant: instant.to_string(),
         num_writes: incoming.num_rows(),
         num_updates: updates,
         num_inserts: inserts,
@@ -1695,12 +1754,15 @@ async fn mor_update_filter(
 ) -> Result<WriteResult> {
     ensure_mor_merge_supported(table)?;
     ensure_configured_record_key(table)?;
+    let instant = request_deltacommit(table, "UPSERT").await?;
     let Some((old, _, _, _)) = data_for_filter_matches(table, &filter).await? else {
+        abort_requested_instant(table, &instant, Action::DeltaCommit).await?;
         return Ok(WriteResult::default());
     };
     let mask = filters_to_row_mask(&[filter], &old)?;
     let (merged, num_updates) = apply_set_updates(&old, &mask, &updates)?;
     if num_updates == 0 {
+        abort_requested_instant(table, &instant, Action::DeltaCommit).await?;
         return Ok(WriteResult::default());
     }
     let matched_indices = mask
@@ -1711,7 +1773,8 @@ async fn mor_update_filter(
     let updated_rows = take_batch(&merged, &matched_indices)?;
     // Drop meta so prepare_batches_for_write stamps the new commit instant.
     let data_only = strip_meta_columns(&updated_rows)?;
-    mor_upsert_batches(table, &[data_only], UpsertOptions::default()).await
+    mor_upsert_batches_at_instant(table, &[data_only], UpsertOptions::default(), Some(instant))
+        .await
 }
 
 async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result<WriteResult> {
@@ -1721,6 +1784,15 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
             "delete requires at least one record key".to_string(),
         ));
     }
+    let instant = request_deltacommit(table, "DELETE").await?;
+    mor_delete_keys_at_instant(table, delete_keys, instant).await
+}
+
+async fn mor_delete_keys_at_instant(
+    table: &mut Table,
+    delete_keys: &[HoodieKey],
+    instant: crate::write::occ::PendingInstant,
+) -> Result<WriteResult> {
     let locations = mor_file_locations(table, delete_keys).await?;
     let mut grouped: HashMap<(String, String), Vec<HoodieKey>> = HashMap::new();
     let mut seen = std::collections::HashSet::new();
@@ -1737,10 +1809,9 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         }
     }
     if grouped.is_empty() {
+        abort_requested_instant(table, &instant, Action::DeltaCommit).await?;
         return Ok(WriteResult::default());
     }
-
-    let instant = request_deltacommit(table, "DELETE").await?;
     let storage = table.file_system_view.storage.clone();
     // Markers for the delete log blocks before any data file is put.
     let mut planned_markers = Vec::new();
@@ -1860,39 +1931,32 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         }
     }
     // Critical section 2: complete deltacommit + MDT, then bookkeeping.
-    let lock = crate::write::lock::lock_provider_for(table);
+    let data_schema = table.get_schema_with_meta_fields().await?;
+    let commit_bytes = deltacommit_metadata_bytes(table, "DELETE", &stats, data_schema.as_ref())?;
+    let lock = crate::write::lock::lock_provider_for(table)?;
     let cs2 = lock.lock().await?;
+    cs2.validate().await?;
+    crate::write::occ::validate_transaction(table, &instant, Action::DeltaCommit, &commit_bytes)
+        .await?;
     if table.is_metadata_table_enabled()
         && let Err(error) =
             crate::write::metadata::write_metadata_commit(storage.as_ref(), &instant, mdt_stats)
                 .await
     {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
         return Err(error);
     }
-    if let Err(error) = complete_deltacommit(
-        table,
-        &instant,
-        "DELETE",
-        stats,
-        table.get_schema_with_meta_fields().await?.as_ref(),
-    )
-    .await
-    {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
+    cs2.validate().await?;
+    complete_deltacommit(table, &instant, "DELETE", stats, data_schema.as_ref()).await?;
     // Durable from here: best-effort maintenance must not fail the write.
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
-    drop(cs2);
+    crate::write::occ::finish_transaction(table, &instant).await;
+    if let Err(error) = cs2.release().await {
+        log::warn!("commit succeeded but releasing the table lock failed: {error}");
+    }
     let _ = table.timeline.reload_completed_commits().await;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
-        instant,
+        instant: instant.to_string(),
         num_writes: 0,
         num_updates: 0,
         num_inserts: 0,
@@ -1909,14 +1973,33 @@ async fn complete_deltacommit(
 ) -> Result<()> {
     let storage = table.file_system_view.storage.clone();
     let timeline = timeline_dir(table);
+    let bytes = deltacommit_metadata_bytes(table, operation, &stats, schema)?;
     // Fencing happened at write start (before data files); this only completes.
+    let layout_two = is_layout_two(table);
+    let completed = if layout_two {
+        Some(generate_instant_time_for_table(table).await?)
+    } else {
+        None
+    };
+    let commit = Instant::new_completed(instant.to_string(), Action::DeltaCommit, completed)?;
+    let path = commit.relative_path_with_base(&timeline)?;
+    storage.put_file_if_absent(&path, bytes).await?;
+    Ok(())
+}
+
+fn deltacommit_metadata_bytes(
+    table: &Table,
+    operation: &str,
+    stats: &[HoodieWriteStat],
+    schema: &arrow_schema::Schema,
+) -> Result<Vec<u8>> {
     let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
     for stat in stats {
         let partition = stat.partition_path.clone().unwrap_or_default();
         partition_to_write_stats
             .entry(partition)
             .or_default()
-            .push(stat);
+            .push(stat.clone());
     }
     let metadata = HoodieCommitMetadata {
         version: Some(1),
@@ -1933,21 +2016,11 @@ async fn complete_deltacommit(
             )?,
         )])),
     };
-    let layout_two = is_layout_two(table);
-    let completed = if layout_two {
-        Some(generate_instant_time().await)
-    } else {
-        None
-    };
-    let commit = Instant::new_completed(instant.to_string(), Action::DeltaCommit, completed)?;
-    let path = commit.relative_path_with_base(&timeline)?;
-    let bytes = if layout_two {
+    Ok(if is_layout_two(table) {
         metadata.to_avro_bytes()?
     } else {
         metadata.to_json_bytes()?
-    };
-    storage.put_file_if_absent(&path, bytes).await?;
-    Ok(())
+    })
 }
 
 /// Java merges the incoming record with the existing one BEFORE deciding a
@@ -2899,34 +2972,42 @@ async fn finalize_rewrite_commit(
     }
 
     // Critical section 2: complete the action, then bookkeeping under lock.
-    let lock = crate::write::lock::lock_provider_for(table);
+    let lock = crate::write::lock::lock_provider_for(table)?;
     let cs2 = lock.lock().await?;
+    cs2.validate().await?;
+    crate::write::occ::validate_transaction(table, instant, action.clone(), &bytes).await?;
+    if table.is_metadata_table_enabled() && !stats_updates.is_empty() {
+        table.timeline.reload_completed_commits().await?;
+        table.file_system_view.clear_cache();
+        mdt_stats.extend(
+            update_partition_stats(table, instant, &stats_updates, schema.as_ref(), old_paths)
+                .await?,
+        );
+    }
     if table.is_metadata_table_enabled()
         && let Err(error) =
             crate::write::metadata::write_metadata_commit(storage.as_ref(), instant, mdt_stats)
                 .await
     {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
         return Err(error);
     }
     let completed = if layout_two {
-        Some(generate_instant_time().await)
+        Some(generate_instant_time_for_table(table).await?)
     } else {
         None
     };
     let commit = Instant::new_completed(instant.to_string(), action, completed)?;
     let path = commit.relative_path_with_base(&timeline_dir(table))?;
+    cs2.validate().await?;
     if let Err(error) = storage.put_file_if_absent(&path, bytes).await {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
         return Err(error.into());
     }
     // Durable from here: best-effort maintenance must not fail the write.
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), instant).await;
-    drop(cs2);
+    crate::write::occ::finish_transaction(table, instant).await;
+    if let Err(error) = cs2.release().await {
+        log::warn!("commit succeeded but releasing the table lock failed: {error}");
+    }
     let _ = table.timeline.reload_completed_commits().await;
     table.file_system_view.clear_cache();
     Ok(WriteResult {
@@ -3243,6 +3324,7 @@ async fn abort_requested_instant(table: &Table, instant: &str, action: Action) -
     };
     storage.delete_file(&requested).await?;
     storage.delete_file(&inflight).await?;
+    crate::write::occ::finish_transaction(table, instant).await;
     Ok(())
 }
 

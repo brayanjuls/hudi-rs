@@ -50,6 +50,15 @@ pub struct FileSystemView {
 }
 
 impl FileSystemView {
+    #[cfg(test)]
+    pub(crate) fn new_with_storage(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
+        Self {
+            hudi_configs,
+            storage,
+            partition_to_file_groups: Arc::new(DashMap::new()),
+        }
+    }
+
     pub(crate) fn configured_base_file_format(&self) -> Result<Option<BaseFileFormatValue>> {
         Ok(BaseFileFormatValue::from_configs(&self.hudi_configs)?)
     }

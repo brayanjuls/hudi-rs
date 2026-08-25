@@ -49,7 +49,7 @@ use crate::write::keygen::{
 };
 use crate::write::metadata::{
     is_column_stats_enabled, update_column_stats_partitions, update_files_partition,
-    update_record_index,
+    update_partition_stats, update_record_index,
 };
 
 /// Result of an append write.
@@ -124,10 +124,12 @@ async fn append_batches_inner(
     };
     let timeline_dir = timeline_dir(table);
     let storage = table.file_system_view.storage.clone();
-    let lock = crate::write::lock::lock_provider_for(table);
+    let lock = crate::write::lock::lock_provider_for(table)?;
     // Critical section 1: mint the instant and fence it, then work unlocked.
     let cs1 = lock.lock().await?;
-    let request_instant = generate_instant_time().await;
+    let request_instant = generate_instant_time_for_table(table).await?;
+    let request_instant = crate::write::occ::begin_transaction(table, &request_instant).await?;
+    cs1.validate().await?;
     crate::write::fence_timeline_instant(
         storage.as_ref(),
         &timeline_dir,
@@ -137,7 +139,12 @@ async fn append_batches_inner(
         crate::write::inflight_commit_metadata_bytes("INSERT", layout_two)?,
     )
     .await?;
-    drop(cs1);
+    cs1.release().await?;
+
+    // `begin_transaction` refreshed the snapshot while CS1 was held. Repeat
+    // the table-dependent validation against that same state; the first pass
+    // keeps invalid input from creating a pending instant in the common case.
+    ensure_append_schema_matches_table(table, schema.as_ref()).await?;
 
     // Group rows across batches by partition path and write one base file per partition.
     let mut partition_rows: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
@@ -418,6 +425,23 @@ async fn append_batches_inner(
     // Critical section 2: complete the action (MDT deltacommit + data commit
     // with a completion time minted under the lock), then bookkeeping.
     let cs2 = lock.lock().await?;
+    cs2.validate().await?;
+    crate::write::occ::validate_transaction(table, &request_instant, action.clone(), &commit_bytes)
+        .await?;
+    if table.is_metadata_table_enabled() && !stats_updates.is_empty() {
+        table.timeline.reload_completed_commits().await?;
+        table.file_system_view.clear_cache();
+        mdt_stats.extend(
+            update_partition_stats(
+                table,
+                &request_instant,
+                &stats_updates,
+                schema.as_ref(),
+                &[],
+            )
+            .await?,
+        );
+    }
     if table.is_metadata_table_enabled()
         && let Err(error) = crate::write::metadata::write_metadata_commit(
             storage.as_ref(),
@@ -426,25 +450,23 @@ async fn append_batches_inner(
         )
         .await
     {
-        for path in &written_paths {
-            let _ = storage.delete_file(path).await;
-        }
+        // Publication errors can be ambiguous on object stores. Preserve all
+        // data/MDT files for heartbeat-expiry rollback instead of risking the
+        // deletion of files belonging to a commit that actually became durable.
         return Err(error);
     }
     let completion = if layout_two {
-        Some(generate_instant_time().await)
+        Some(generate_instant_time_for_table(table).await?)
     } else {
         None
     };
-    let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
+    let instant = Instant::new_completed(request_instant.to_string(), action, completion)?;
     let commit_relative_path = instant.relative_path_with_base(&timeline_dir)?;
+    cs2.validate().await?;
     if let Err(error) = storage
         .put_file_if_absent(&commit_relative_path, commit_bytes)
         .await
     {
-        for path in &written_paths {
-            let _ = storage.delete_file(path).await;
-        }
         return Err(error.into());
     }
     // The commit is durable from here: post-commit maintenance (markers,
@@ -452,13 +474,16 @@ async fn append_batches_inner(
     // not turn a committed write into an Err the caller would retry.
     let _ =
         crate::write::post_complete_bookkeeping(table, storage.as_ref(), &request_instant).await;
-    drop(cs2);
+    crate::write::occ::finish_transaction(table, &request_instant).await;
+    if let Err(error) = cs2.release().await {
+        log::warn!("commit succeeded but releasing the table lock failed: {error}");
+    }
 
     let _ = table.timeline.reload_completed_commits().await;
     table.file_system_view.clear_cache();
 
     Ok(AppendResult {
-        instant: request_instant,
+        instant: request_instant.to_string(),
         commit_relative_path,
         base_file_path: primary_base_path,
         num_rows,
@@ -547,27 +572,18 @@ const MAX_EXPECTED_CLOCK_SKEW_MS: u64 = 1;
 /// `SkewAdjustingTimeGenerator` + `HoodieInstantTimeGenerator.createNewInstantTime`).
 ///
 /// Under a process-wide lock: capture the clock, wait out the max expected
-/// clock skew, and return the captured time — retrying (never bumping +1) until
-/// it exceeds every previously minted instant. Used for both requested and
-/// completion timestamps, so completion times are strictly greater than the
-/// requested times minted before them. Format `yyyyMMddHHmmssSSS` (UTC).
-/// Whether instants are formatted in local time (Java's
-/// `HoodieTimelineTimeZone.LOCAL`, the Hudi default) or UTC. Process-wide,
-/// mirroring `HoodieInstantTimeGenerator.setCommitTimeZone`; set from the
-/// table's `hoodie.table.timeline.timezone` when a table is created or
-/// loaded for writes. Spark writers mint LOCAL-time instants by default, so
-/// matching the table's declared zone keeps mixed-writer timelines ordered.
-static COMMIT_TIME_IS_LOCAL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-pub(crate) fn set_commit_timezone(timezone: &str) {
-    COMMIT_TIME_IS_LOCAL.store(
-        !timezone.eq_ignore_ascii_case("utc"),
-        std::sync::atomic::Ordering::Release,
-    );
+/// clock skew, and return the captured time. If a distributed writer's visible
+/// timeline high-water mark is ahead of the local clock, advance that valid
+/// instant by one millisecond rather than holding the table lock until the
+/// clock catches up. Used for both requested and completion timestamps, so
+/// completion times are strictly greater than requested times minted before
+/// them. Format `yyyyMMddHHmmssSSS`.
+#[cfg(test)]
+pub(crate) async fn generate_instant_time() -> String {
+    generate_instant_time_after(None, true).await
 }
 
-pub(crate) async fn generate_instant_time() -> String {
+async fn generate_instant_time_after(minimum: Option<&str>, is_local: bool) -> String {
     static TIME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = TIME_LOCK.lock().await;
     loop {
@@ -578,13 +594,76 @@ pub(crate) async fn generate_instant_time() -> String {
         if candidate_millis > LAST_EPOCH_MILLIS.load(Ordering::Acquire) {
             LAST_EPOCH_MILLIS.store(candidate_millis, Ordering::Release);
             let format = "%Y%m%d%H%M%S%3f";
-            return if COMMIT_TIME_IS_LOCAL.load(std::sync::atomic::Ordering::Acquire) {
+            let formatted = if is_local {
                 now.with_timezone(&chrono::Local).format(format).to_string()
             } else {
                 now.format(format).to_string()
             };
+            if minimum.is_none_or(|minimum| formatted.as_str() > minimum) {
+                return formatted;
+            }
+            if let Some(minimum) = minimum
+                && let Some(next) = instant_time_plus_one_millisecond(minimum, is_local)
+            {
+                return next;
+            }
         }
     }
+}
+
+fn instant_time_plus_one_millisecond(instant: &str, is_local: bool) -> Option<String> {
+    let datetime = Instant::parse_datetime(instant, if is_local { "LOCAL" } else { "UTC" }).ok()?;
+    let next = datetime.checked_add_signed(chrono::TimeDelta::milliseconds(1))?;
+    let format = "%Y%m%d%H%M%S%3f";
+    Some(if is_local {
+        next.with_timezone(&chrono::Local)
+            .format(format)
+            .to_string()
+    } else {
+        next.format(format).to_string()
+    })
+}
+
+pub(crate) async fn generate_instant_time_in_timezone_after(
+    timezone: &str,
+    minimum: Option<&str>,
+) -> String {
+    generate_instant_time_after(minimum, !timezone.eq_ignore_ascii_case("utc")).await
+}
+
+/// Mint an instant strictly greater than every timestamp visible on the
+/// active timeline. Callers hold the table lock, so this extends the local
+/// monotonic generator across independent writer processes.
+pub(crate) async fn generate_instant_time_for_table(table: &Table) -> Result<String> {
+    let timeline = timeline_dir(table);
+    let files = match table
+        .file_system_view
+        .storage
+        .list_files(Some(&timeline))
+        .await
+    {
+        Ok(files) => files,
+        Err(crate::storage::error::StorageError::ObjectStoreError(
+            object_store::Error::NotFound { .. },
+        )) => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut high_watermark: Option<String> = None;
+    for file in files {
+        let stem = file.name.split('.').next().unwrap_or_default();
+        for timestamp in stem.split('_') {
+            if timestamp
+                .chars()
+                .all(|character| character.is_ascii_digit())
+                && high_watermark
+                    .as_ref()
+                    .is_none_or(|current| timestamp > current.as_str())
+            {
+                high_watermark = Some(timestamp.to_string());
+            }
+        }
+    }
+    Ok(generate_instant_time_in_timezone_after(&table.timezone(), high_watermark.as_deref()).await)
 }
 
 /// Default max base-file size (Java `hoodie.parquet.max.file.size` = 120 MiB).
@@ -961,6 +1040,14 @@ pub(crate) fn prepare_batches_for_write_with_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_instant_time_plus_one_handles_a_remote_future_clock() {
+        assert_eq!(
+            instant_time_plus_one_millisecond("30000101000000000", false).as_deref(),
+            Some("30000101000000001")
+        );
+    }
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     #[test]

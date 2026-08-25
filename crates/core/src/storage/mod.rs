@@ -26,7 +26,7 @@ use std::sync::Arc;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, parse_url_opts};
+use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion, parse_url_opts};
 use url::Url;
 
 use crate::config::HudiConfigs;
@@ -105,8 +105,78 @@ pub struct Storage {
     pub(crate) hudi_configs: Arc<HudiConfigs>,
 }
 
+/// Opaque object version used for conditional compare-and-swap writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObjectVersion {
+    e_tag: Option<String>,
+    version: Option<String>,
+}
+
+impl From<object_store::ObjectMeta> for ObjectVersion {
+    fn from(meta: object_store::ObjectMeta) -> Self {
+        Self {
+            e_tag: meta.e_tag,
+            version: meta.version,
+        }
+    }
+}
+
+impl From<ObjectVersion> for UpdateVersion {
+    fn from(value: ObjectVersion) -> Self {
+        Self {
+            e_tag: value.e_tag,
+            version: value.version,
+        }
+    }
+}
+
+impl From<object_store::PutResult> for ObjectVersion {
+    fn from(result: object_store::PutResult) -> Self {
+        Self {
+            e_tag: result.e_tag,
+            version: result.version,
+        }
+    }
+}
+
+/// Bytes read together with the exact object version that produced them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct VersionedFile {
+    pub bytes: Bytes,
+    pub version: ObjectVersion,
+}
+
+/// Result of a conditional create or update.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConditionalPutResult {
+    /// The write succeeded and produced this new object version.
+    Written(ObjectVersion),
+    /// The object existed or changed after the caller observed it.
+    Conflict,
+}
+
 impl Storage {
     pub const CLOUD_STORAGE_PREFIXES: [&'static str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
+
+    /// Merge Hudi-style and standard cloud environment variables into storage
+    /// options without overriding values supplied explicitly by the caller.
+    pub(crate) fn extend_options_from_env(options: &mut HashMap<String, String>) {
+        for (env_key, env_value) in std::env::vars() {
+            let lower_option_key = if let Some(stripped) = env_key.strip_prefix("HOODIE_ENV_") {
+                Some(stripped.replace("_DOT_", ".").to_ascii_lowercase())
+            } else if Self::CLOUD_STORAGE_PREFIXES
+                .iter()
+                .any(|prefix| env_key.starts_with(prefix))
+            {
+                Some(env_key.to_ascii_lowercase())
+            } else {
+                None
+            };
+            if let Some(key) = lower_option_key {
+                options.entry(key).or_insert(env_value);
+            }
+        }
+    }
 
     pub fn new(
         options: Arc<HashMap<String, String>>,
@@ -147,6 +217,23 @@ impl Storage {
             Arc::new(HashMap::new()),
             Arc::new(HudiConfigs::new(hudi_options)),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_object_store(
+        base_url: Url,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Arc<Storage> {
+        let configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath,
+            base_url.as_str(),
+        )]));
+        Arc::new(Storage {
+            base_url: Arc::new(base_url),
+            object_store,
+            options: Arc::new(HashMap::new()),
+            hudi_configs: configs,
+        })
     }
 
     #[cfg(feature = "datafusion")]
@@ -273,6 +360,19 @@ impl Storage {
         Ok(())
     }
 
+    /// Return the object's last-modified time, or `None` when it does not exist.
+    pub(crate) async fn file_last_modified(
+        &self,
+        relative_path: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let obj_path = self.relative_obj_path(relative_path)?;
+        match self.object_store.head(&obj_path).await {
+            Ok(metadata) => Ok(Some(metadata.last_modified)),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Write a file only if nothing exists at the path (`PutMode::Create`).
     ///
     /// Timeline files must never silently replace one another: two writers
@@ -287,16 +387,90 @@ impl Storage {
     ) -> Result<()> {
         let obj_path = self.relative_obj_path(relative_path)?;
         let options = PutOptions::from(PutMode::Create);
+        let bytes = bytes.into();
+        match self
+            .object_store
+            .put_opts(&obj_path, PutPayload::from(bytes.clone()), options)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // A conditional object-store PUT can be durable even when the
+                // client observes a timeout/reset. Reconcile the exact path
+                // before reporting failure: identical bytes make this retry
+                // idempotent, while different bytes retain the original error.
+                if self
+                    .get_file_data(relative_path)
+                    .await
+                    .is_ok_and(|stored| stored == bytes)
+                {
+                    return Ok(());
+                }
+                match error {
+                    object_store::Error::AlreadyExists { path, source } => {
+                        Err(error::StorageError::AlreadyExists(path, source))
+                    }
+                    error => Err(error.into()),
+                }
+            }
+        }
+    }
+
+    /// Read a small object with the ETag/version required for a conditional update.
+    pub(crate) async fn get_versioned_file(
+        &self,
+        relative_path: &str,
+    ) -> Result<Option<VersionedFile>> {
+        let obj_path = self.relative_obj_path(relative_path)?;
+        match self.object_store.get(&obj_path).await {
+            Ok(result) => {
+                let version = ObjectVersion::from(result.meta.clone());
+                let bytes = result.bytes().await?;
+                Ok(Some(VersionedFile { bytes, version }))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Atomically create a small object if it does not exist.
+    pub(crate) async fn create_versioned_file(
+        &self,
+        relative_path: &str,
+        bytes: impl Into<Bytes>,
+    ) -> Result<ConditionalPutResult> {
+        let obj_path = self.relative_obj_path(relative_path)?;
+        let options = PutOptions::from(PutMode::Create);
         match self
             .object_store
             .put_opts(&obj_path, PutPayload::from(bytes.into()), options)
             .await
         {
-            Ok(_) => Ok(()),
-            Err(object_store::Error::AlreadyExists { path, source }) => {
-                Err(error::StorageError::AlreadyExists(path, source))
-            }
-            Err(e) => Err(e.into()),
+            Ok(result) => Ok(ConditionalPutResult::Written(result.into())),
+            Err(object_store::Error::AlreadyExists { .. })
+            | Err(object_store::Error::Precondition { .. }) => Ok(ConditionalPutResult::Conflict),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Atomically replace a small object only if its observed version is unchanged.
+    pub(crate) async fn update_versioned_file(
+        &self,
+        relative_path: &str,
+        bytes: impl Into<Bytes>,
+        previous: ObjectVersion,
+    ) -> Result<ConditionalPutResult> {
+        let obj_path = self.relative_obj_path(relative_path)?;
+        let options = PutOptions::from(PutMode::Update(previous.into()));
+        match self
+            .object_store
+            .put_opts(&obj_path, PutPayload::from(bytes.into()), options)
+            .await
+        {
+            Ok(result) => Ok(ConditionalPutResult::Written(result.into())),
+            Err(object_store::Error::AlreadyExists { .. })
+            | Err(object_store::Error::Precondition { .. }) => Ok(ConditionalPutResult::Conflict),
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -587,5 +761,70 @@ mod tests {
 
         let data = storage.get_file_data("timeline/0001.commit").await.unwrap();
         assert_eq!(data.as_ref(), b"first", "loser must not clobber the winner");
+    }
+
+    #[tokio::test]
+    async fn storage_put_file_if_absent_accepts_identical_retry() {
+        let storage = Storage::new_with_object_store(
+            Url::parse("memory:///table").unwrap(),
+            Arc::new(object_store::memory::InMemory::new()),
+        );
+        storage
+            .put_file_if_absent("timeline/0001.commit", b"same".as_slice())
+            .await
+            .unwrap();
+        storage
+            .put_file_if_absent("timeline/0001.commit", b"same".as_slice())
+            .await
+            .expect("an identical create retry is an idempotent success");
+    }
+
+    #[tokio::test]
+    async fn storage_conditional_update_rejects_stale_object_version() {
+        let storage = Storage::new_with_object_store(
+            Url::parse("memory:///table").unwrap(),
+            Arc::new(object_store::memory::InMemory::new()),
+        );
+        let first = storage
+            .create_versioned_file(".hoodie/.locks/table_lock.json", b"first".as_slice())
+            .await
+            .unwrap();
+        let ConditionalPutResult::Written(first_version) = first else {
+            panic!("first conditional create must win");
+        };
+        assert_eq!(
+            storage
+                .create_versioned_file(".hoodie/.locks/table_lock.json", b"other".as_slice())
+                .await
+                .unwrap(),
+            ConditionalPutResult::Conflict
+        );
+
+        let second = storage
+            .update_versioned_file(
+                ".hoodie/.locks/table_lock.json",
+                b"second".as_slice(),
+                first_version.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(second, ConditionalPutResult::Written(_)));
+        assert_eq!(
+            storage
+                .update_versioned_file(
+                    ".hoodie/.locks/table_lock.json",
+                    b"stale".as_slice(),
+                    first_version,
+                )
+                .await
+                .unwrap(),
+            ConditionalPutResult::Conflict
+        );
+        let current = storage
+            .get_versioned_file(".hoodie/.locks/table_lock.json")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.bytes.as_ref(), b"second");
     }
 }

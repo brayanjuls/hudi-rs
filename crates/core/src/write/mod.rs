@@ -25,14 +25,14 @@ mod keygen;
 pub mod lock;
 pub(crate) mod markers;
 pub(crate) mod metadata;
+pub(crate) mod occ;
 mod rewrite;
 pub(crate) mod rollback;
 pub(crate) mod sizing;
 
-pub(crate) use append::set_commit_timezone;
 pub use append::{AppendResult, append_batches, append_batches_only};
 pub use create::TableCreateBuilder;
-pub use lock::{InProcessLockProvider, LockLease, LockProvider};
+pub use lock::{InProcessLockProvider, LockLease, LockProvider, StorageBasedLockProvider};
 pub(crate) use rewrite::ensure_writable_table_version;
 pub use rewrite::{
     UpsertOptions, WriteResult, delete_filter, delete_keys, dynamic_partition_overwrite_batches,
@@ -393,8 +393,8 @@ pub(crate) fn build_delete_log_block(
 mod tests {
     use super::*;
 
-    /// Two writers fencing the same instant: the second must get a conflict,
-    /// not silently share the instant.
+    /// An identical retry is idempotent, but a different writer payload on the
+    /// same instant must conflict rather than silently share the instant.
     #[tokio::test]
     async fn test_fence_timeline_instant_conflicts_on_same_timestamp() {
         let dir = tempfile::tempdir().unwrap();
@@ -407,7 +407,7 @@ mod tests {
             "20260101000000000",
             Action::Commit,
             Vec::new(),
-            Vec::new(),
+            b"different-writer".to_vec(),
         )
         .await
         .unwrap();
